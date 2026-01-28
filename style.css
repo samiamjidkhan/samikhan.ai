@@ -141,3 +141,20 @@ footer a:hover {
     color: #444;
     font-size: 0.85rem;
 }
+
+/* Mobile */
+@media (max-width: 600px) {
+    body {
+        padding: 2rem 1.5rem;
+    }
+
+    nav a {
+        margin-right: 1rem;
+    }
+
+    footer a {
+        display: inline-block;
+        margin-right: 1rem;
+        margin-bottom: 0.5rem;
+    }
+}
