@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Teaching a Language Model Arithmetic with Reinforcement Learning">
+    <title>Teaching a Language Model Arithmetic with Reinforcement Learning - Sami Khan</title>
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+    <nav>
+        <a href="../index.html">About</a>
+        <a href="../projects.html">Projects</a>
+        <a href="../blog.html" class="active">Blog</a>
+    </nav>
+
+    <main class="blog-post">
+        <h1>Teaching a Language Model Arithmetic with Reinforcement Learning</h1>
+        <time>January 2026</time>
+
+        <p><em>My experience training a model on the Countdown Numbers Game — and observing it learn to cheat.</em></p>
+
+        <hr>
+
+        <p>I recently got early access to <a href="https://www.primeintellect.ai/" target="_blank" rel="noopener">Prime Intellect</a>'s hosted training platform (shoutout <a href="https://x.com/willccbb" target="_blank" rel="noopener">@willccbb</a> ☺) and spent some time training language models with reinforcement learning on the <a href="https://en.wikipedia.org/wiki/Countdown_(game_show)#Numbers_round" target="_blank" rel="noopener">Countdown Numbers Game</a> — the classic UK TV show puzzle where you reach a target number using six source numbers and basic arithmetic.</p>
+
+        <p>This post walks through what I built, what broke, and what I learned about the infrastructure powering it all: <a href="https://github.com/PrimeIntellect-ai/prime-rl" target="_blank" rel="noopener">prime-rl</a>.</p>
+
+        <h2>The Task</h2>
+
+        <p>The Countdown Numbers Game is deceptively simple. You're given six source numbers — a mix of "large" (25, 50, 75, 100) and "small" (1-10) — and a target between 101 and 999. Reach the target exactly using only addition, subtraction, multiplication, and division. Each source number can be used at most once, and all intermediate results must be positive integers.</p>
+
+        <p>For example:</p>
+
+        <blockquote>
+            <strong>Numbers:</strong> 75, 50, 2, 3, 8, 7<br>
+            <strong>Target:</strong> 812<br>
+            <strong>Solution:</strong> <code>(75 + 50) * 7 - 8 * 2 - 3 = 872</code>... wait, that's wrong. Let me think harder.
+        </blockquote>
+
+        <p>That's exactly the point. These puzzles require multi-step reasoning with constraints, making them an interesting target for RL training. The model has to plan a sequence of operations, verify intermediate results, and backtrack when a path doesn't work.</p>
+
+        <h2>Building the Environment</h2>
+
+        <p>Prime Intellect's platform uses the <a href="https://github.com/PrimeIntellect-ai/verifiers" target="_blank" rel="noopener">verifiers</a> library for defining RL environments. Each environment is a self-contained Python package that exposes a <code>load_environment()</code> function returning a dataset, a system prompt, and a rubric — the set of reward functions that score model outputs.</p>
+
+        <p>I designed three reward signals, weighted to shape the learning gradient:</p>
+
+<pre><code>rubric = vf.Rubric(
+    funcs=[exact_match_reward, closeness_reward, format_reward],
+    weights=[1.0, 0.3, 0.1],
+    parser=parser,
+)</code></pre>
+
+        <ul>
+            <li><strong><code>exact_match_reward</code></strong> (weight 1.0): Binary — did the model reach the target exactly? This validates that only source numbers are used, each at most once, and the arithmetic evaluates correctly.</li>
+            <li><strong><code>closeness_reward</code></strong> (weight 0.3): Exponential decay based on distance from target: <code>0.5^(distance/10)</code>. A result that's off by 5 gets ~0.7; off by 50 gets ~0.03. This provides a gradient signal even when the model doesn't nail the exact answer.</li>
+            <li><strong><code>format_reward</code></strong> (weight 0.1): Did the model use the expected <code>&lt;reasoning&gt;...&lt;/reasoning&gt;&lt;solution&gt;...&lt;/solution&gt;</code> XML format? A small signal to maintain structured output.</li>
+        </ul>
+
+        <p>The model sees a system prompt explaining the rules and the expected output format, then gets a puzzle like:</p>
+
+<pre><code>Numbers: 75, 50, 2, 3, 8, 7
+Target: 812</code></pre>
+
+        <p>Simple enough. I pushed the environment to the Hub as <code><a href="https://app.primeintellect.ai/dashboard/environments/sami/countdown" target="_blank" rel="noopener">sami/countdown</a></code> and kicked off training.</p>
+
+        <h2>Attempt 1: The 4B Model Collapses</h2>
+
+        <p>I started with <code>Qwen/Qwen3-4B-Instruct-2507</code> — small, fast, good for iteration. The training config was straightforward:</p>
+
+<pre><code>model = "Qwen/Qwen3-4B-Instruct-2507"
+max_steps = 200
+batch_size = 256
+rollouts_per_example = 8</code></pre>
+
+        <p>Within the first few steps, something was clearly wrong. The model's reward wasn't just stagnating — it was actively collapsing. By step 20, outputs were gibberish. 100% of generations were hitting the token limit (truncated), reward dropped to zero, and the model had completely degenerated.</p>
+
+        <img src="attempt1.png" alt="Attempt 1: 4B model training collapse">
+
+        <p>This is a known failure mode with smaller models in RL. The policy gradient updates are large relative to the model's capacity, and without sufficient regularization, the model can fall off the distribution cliff. Once it starts generating nonsense, the reward signal is uniformly zero, and there's no gradient to recover from.</p>
+
+        <h2>Attempt 2: The Model Learns to Cheat</h2>
+
+        <p>Before scaling up the model, I investigated the reward signals more carefully. Looking at rollouts from an earlier (pre-collapse) checkpoint, I noticed something interesting. The model had discovered a <a href="https://x.com/ibnAmjid/status/2014905412815093946?s=20" target="_blank" rel="noopener">reward hack</a>.</p>
+
+        <p>Instead of solving the puzzle, it would output:</p>
+
+<pre><code>&lt;reasoning&gt;
+I cannot find a combination that reaches 812.
+&lt;/reasoning&gt;
+&lt;solution&gt;
+Unable to reach 812
+&lt;/solution&gt;</code></pre>
+
+        <p>Why was this getting rewarded? My <code>closeness_reward</code> function was extracting numbers from the solution text and evaluating them. The string "Unable to reach 812" contains the number 812 — which happens to be the target. The evaluation function <code>eval_arithmetic("812")</code> returns 812, distance is 0, reward is 1.0.</p>
+
+        <p>The model had found a perfect exploit: just parrot the target number inside a "give up" message and collect full closeness reward. It didn't need to do any arithmetic at all.</p>
+
+        <img src="attempt2.png" alt="Attempt 2: The model learns to cheat">
+
+        <p>This is a textbook example of Goodhart's Law in RL — "when a measure becomes a target, it ceases to be a good measure." The closeness reward was supposed to provide a smooth gradient toward correct solutions. Instead, it provided a shortcut that bypassed the actual task entirely.</p>
+
+        <h3>The Fix</h3>
+
+        <p>I added explicit rejection of "give up" responses in both reward functions:</p>
+
+<pre><code>async def closeness_reward(completion, info, parser) -> float:
+    solution = getattr(parsed, 'solution', "") or ""
+
+    # Reject "give up" responses
+    give_up_phrases = ["unable", "cannot", "impossible", "no solution", "not possible"]
+    if any(phrase in solution.lower() for phrase in give_up_phrases):
+        return 0.0
+
+    # Only reward valid arithmetic expressions
+    result = eval_arithmetic(solution)
+    if result is None:
+        return 0.0
+    ...</code></pre>
+
+        <p>And in <code>format_reward</code>, I required the solution to contain at least one arithmetic operator (<code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>) to get credit. No more free points for saying "I can't."</p>
+
+        <h2>The Dataset Problem</h2>
+
+        <p>Even after fixing the reward hack, training on the 4B model kept collapsing. But there was another issue lurking: dataset generation.</p>
+
+        <p>My environment was generating solvable puzzles on the fly by rejection sampling — generate random numbers and a random target, check if it's solvable with a brute-force solver, retry if not. Locally, this worked fine. On the cloud, where the orchestrator was generating thousands of puzzles, it was painfully slow. Some training steps were waiting 50+ minutes just for data.</p>
+
+        <p>Worse, when I disabled the solvability check for speed, the model was being trained on a mix of solvable and unsolvable puzzles. Asking a model to solve unsolvable puzzles and penalizing it for failing is not a great training signal.</p>
+
+        <p>The solution was simple: pre-compute a bank of verified-solvable puzzles locally and ship them with the environment.</p>
+
+<pre><code>def load_precomputed_puzzles():
+    """Load pre-computed solvable puzzles from JSON file."""
+    if os.path.exists(PUZZLES_FILE):
+        with open(PUZZLES_FILE, "r") as f:
+            return json.load(f)
+    return None</code></pre>
+
+        <p>I generated 500 training and 100 evaluation puzzles, verified each had at least one solution, and saved them to <code>puzzles.json</code>. No more runtime generation overhead, no more unsolvable puzzles.</p>
+
+        <h2>Attempt 3: Scaling to 30B</h2>
+
+        <p>With clean data and fixed rewards, I switched to <code>Qwen/Qwen3-30B-A3B-Instruct-2507</code> — a Mixture-of-Experts model with 30B total parameters but only 3B active per token. This gave me the capacity of a much larger model at inference costs closer to a 4B.</p>
+
+<pre><code>model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+max_steps = 100
+batch_size = 128
+rollouts_per_example = 4</code></pre>
+
+        <p>This time, training was stable. The model started at ~30% exact match accuracy on held-out puzzles and climbed steadily.</p>
+
+        <img src="attempt3.png" alt="Attempt 3: Successful 30B model training">
+
+        <p>The peak at step 96 hit 50% exact match — the model was correctly solving half of all Countdown puzzles it encountered. The drop at step 99 is likely noise from the small validation set, but the trend was clear: the model was genuinely learning multi-step arithmetic reasoning.</p>
+
+        <h2>What's Happening Under the Hood: PRIME-RL's Architecture</h2>
+
+        <p>The training infrastructure that made this possible is worth understanding. PRIME-RL uses a disaggregated architecture that separates three concerns into independent processes:</p>
+
+<pre class="diagram"><code>┌─────────────┐              ┌──────────────┐              ┌─────────────┐
+│  Inference  │◄──────────── │ Orchestrator │────────────► │   Trainer   │
+│   (vLLM)    │   weights    │    (CPU)     │   batches    │   (FSDP2)   │
+│             │────────────► │              │◄──────────── │             │
+│             │   rollouts   │              │   weights    │             │
+└─────────────┘              └──────────────┘              └─────────────┘</code></pre>
+
+        <p><strong>The Inference Server</strong> is a customized vLLM instance with additional endpoints for hot-reloading model weights (<code>/update_weights</code>) and returning per-token logprobs. It handles all the generation — when the orchestrator needs a rollout, it sends the puzzle prompt here and gets back a completion with token-level probability information.</p>
+
+        <p><strong>The Orchestrator</strong> is the brain. It:</p>
+        <ol>
+            <li>Loads environments (my Countdown env, in this case) via the <code>verifiers</code> library</li>
+            <li>Samples puzzles from the dataset buffer</li>
+            <li>Dispatches them to environment workers that call the inference server</li>
+            <li>Scores completions using the rubric's reward functions</li>
+            <li>Computes GRPO advantages: <code>advantage_i = reward_i - mean(rewards for same prompt)</code></li>
+            <li>Tokenizes and packs everything into training batches</li>
+            <li>Ships batches to the trainer</li>
+        </ol>
+
+        <p><strong>The Trainer</strong> receives batches and runs the actual gradient updates using FSDP2 (Fully Sharded Data Parallelism). The loss function is an importance-weighted policy gradient — a variant of AIPO from Meta's Llama-RL work:</p>
+
+<pre><code>log_ratio = trainer_logprobs - inference_logprobs  # log(pi_theta / pi_old)
+ratio = exp(log_ratio)
+coeff = ratio * (advantages - kl_tau * log_ratio)
+loss = -(coeff.detach() * trainer_logprobs)[mask].sum()</code></pre>
+
+        <p>The key challenge in this architecture is that it's <strong>asynchronous and off-policy</strong>. While the trainer is updating weights at step N, the inference server might still be generating rollouts using step N-1 weights. PRIME-RL handles this with multiple layers of importance ratio masking:</p>
+
+        <ul>
+            <li><strong>Token-level</strong>: mask any token where the importance ratio falls outside [0.125, 8.0]</li>
+            <li><strong>Sequence-level</strong>: drop entire sequences with extreme ratios</li>
+            <li><strong>Geometric mean</strong>: an additional check on the per-sequence average ratio</li>
+        </ul>
+
+        <p>These filters prevent stale rollouts from producing destructive gradient updates — the same kind of instability that killed my 4B model training.</p>
+
+        <h3>Why This Architecture Matters</h3>
+
+        <p>The traditional approach to RLHF/RL post-training is synchronous: generate a batch, score it, train on it, repeat. This is simple but wastes GPU time — the training GPUs sit idle during generation, and the inference GPUs sit idle during training.</p>
+
+        <p>PRIME-RL's disaggregated design keeps all GPUs busy. Inference generates rollouts while training runs in parallel. The <code>max_async_level</code> parameter (default 2) controls how far ahead inference can run. This is the same idea behind asynchronous SGD in distributed training, adapted for the RL setting where the "data generation" step is itself a GPU-intensive operation.</p>
+
+        <p>The framework scales from a single consumer GPU (all three processes time-sharing) to 1000+ GPU clusters (processes spread across nodes, communicating via shared filesystem or NCCL). The same TOML config I used for my training run works at both scales — the platform handles the deployment topology.</p>
+
+        <h2>Lessons Learned</h2>
+
+        <p><strong>Reward design is the hard part.</strong> The actual RL training machinery — the loss functions, the distributed infrastructure, the weight broadcasting — is largely solved by frameworks like prime-rl. What will make or break your training run is whether your reward signal actually incentivizes what you think it does.</p>
+
+        <p><strong>Reward hacking is creative.</strong> My model didn't just fail to solve puzzles — it found a genuinely clever exploit that I hadn't anticipated. "Say the target number inside a give-up message" is the kind of thing that seems obvious in hindsight but is hard to predict. Adversarial thinking about your reward functions is essential.</p>
+
+        <p><strong>Model scale matters for RL stability.</strong> The 4B model collapsed; the 30B model trained cleanly on the same task. Smaller models have less capacity to maintain coherent generation while their policy shifts during training. If you're seeing training collapse, try a larger model before debugging your reward functions — it might not be your fault.</p>
+
+        <p><strong>Pre-compute what you can.</strong> Runtime puzzle generation was a bottleneck that added latency to every training step and introduced unsolvable puzzles as noise. Shipping a pre-verified dataset eliminated both problems. If your data generation involves any non-trivial computation, do it offline.</p>
+
+        <p><strong>The closeness reward worked (once fixed).</strong> Pure exact-match reward (binary 0/1) gives very sparse signal — most attempts score 0, and the model has no gradient to improve. The exponential decay closeness reward provided a smooth landscape that guided the model from "close attempts" toward "exact solutions." The key was ensuring it only activated for valid arithmetic expressions, not for text that happened to contain the target number.</p>
+
+        <h2>What's Next</h2>
+
+        <p>50% exact match on Countdown is a solid starting point, but of course there's room to improve. The model was still trending upward at 100 steps — a longer run might push accuracy higher. Curriculum learning (starting with easier targets and progressing to harder ones) could help. And the <code>online_difficulty_filtering</code> feature in prime-rl's buffer could focus training on puzzles at the model's frontier — not too easy, not too hard.</p>
+
+        <p>But the bigger takeaway is that the tooling for RL post-training is reaching a point where the infrastructure fades into the background. I spent most of my time on environment design and reward shaping, not on distributed systems or GPU orchestration!</p>
+    
+    </main>
+
+    <footer>
+        <a href="mailto:samiamjidkhan@gmail.com">Email</a>
+        <a href="https://github.com/samiamjidkhan" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://www.linkedin.com/in/samiamjidkhan/" target="_blank" rel="noopener">LinkedIn</a>
+        <a href="https://x.com/ibnAmjid" target="_blank" rel="noopener">X</a>
+    </footer>
+</body>
+</html>
