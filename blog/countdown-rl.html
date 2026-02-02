@@ -179,22 +179,36 @@ rollouts_per_example = 4</code></pre>
             <li>Ships batches to the trainer</li>
         </ol>
 
-        <p><strong>The Trainer</strong> receives batches and runs the actual gradient updates using FSDP2 (Fully Sharded Data Parallelism). The loss function is an importance-weighted policy gradient — a variant of AIPO from Meta's Llama-RL work:</p>
+        <p><strong>The Trainer</strong> receives batches and runs the actual gradient updates using FSDP2 (Fully Sharded Data Parallelism). The loss function belongs to the family of <strong>importance-sampled policy optimization</strong> methods — closest to <a href="https://arxiv.org/abs/2506.13585" target="_blank" rel="noopener"><strong>CISPO</strong></a> (Clipped Importance Sampling Policy Optimization, from MiniMax-M1) and <a href="https://arxiv.org/abs/2510.18855" target="_blank" rel="noopener"><strong>IcePop</strong></a> (from Ant Group's Ring-1T). The <a href="https://arxiv.org/abs/2512.16144" target="_blank" rel="noopener">INTELLECT-3 technical report</a> describes the specific variant used in prime-rl as "masked token-level importance sampling".</p>
 
-<pre><code>log_ratio = trainer_logprobs - inference_logprobs  # log(pi_theta / pi_old)
-ratio = exp(log_ratio)
-coeff = ratio * (advantages - kl_tau * log_ratio)
+        <p>To understand why this matters, it helps to compare with the alternatives. Standard <strong>GRPO</strong> clips the policy ratio directly in the objective — if a token's importance ratio <code>π_new/π_old</code> drifts outside <code>[1-ε, 1+ε]</code>, its contribution is clamped. The problem: this suppresses updates on rare "fork" tokens (pivotal reasoning steps like "wait" or "actually") that naturally have low probability and high importance ratios. Those are exactly the tokens RL should be reinforcing.</p>
+
+        <p><strong>CISPO</strong> solves this by detaching the importance weight from the gradient and capping it as a constant multiplier. All tokens still get gradient updates — the weight is just bounded. <strong>IcePop</strong> takes a harder line: it <strong>masks out</strong> tokens entirely where the ratio falls outside <code>[α, β]</code>, producing zero gradient for those tokens. This is more aggressive but more stable, especially for MoE models where router inconsistencies between training and inference amplify distribution shift.</p>
+
+        <p>PRIME-RL's implementation uses IcePop-style hard masking with a CISPO-like detached coefficient:</p>
+
+<pre><code># Per-token importance ratio
+ratio = exp(trainer_logprobs - inference_logprobs)  # π_train / π_infer
+
+# IcePop masking: hard-drop tokens outside [α, β]
+# (default α=0.125, β=8.0)
+mask = (ratio >= α) & (ratio <= β)
+
+# Detached coefficient (gradient only flows through log π_train)
+coeff = ratio * advantages
 loss = -(coeff.detach() * trainer_logprobs)[mask].sum()</code></pre>
 
-        <p>The key challenge in this architecture is that it's <strong>asynchronous and off-policy</strong>. While the trainer is updating weights at step N, the inference server might still be generating rollouts using step N-1 weights. PRIME-RL handles this with multiple layers of importance ratio masking:</p>
+        <p>The key challenge is that the architecture is <strong>asynchronous and off-policy</strong>. While the trainer updates weights at step N, the inference server might still be generating rollouts using step N-1 weights. This is what makes the masking critical — without it, stale rollouts produce importance ratios that blow up the gradient. The INTELLECT-3 paper notes that alternative approaches like GSPO caused reward collapse under high off-policyness.</p>
+
+        <p>PRIME-RL extends the base formulation with multiple masking layers for additional stability:</p>
 
         <ul>
             <li><strong>Token-level</strong>: mask any token where the importance ratio falls outside [0.125, 8.0]</li>
-            <li><strong>Sequence-level</strong>: drop entire sequences with extreme ratios</li>
-            <li><strong>Geometric mean</strong>: an additional check on the per-sequence average ratio</li>
+            <li><strong>Sequence-level</strong>: drop entire sequences where any token's ratio falls outside [0, 100]</li>
+            <li><strong>Geometric mean</strong>: mask based on the geometric mean of per-token ratios across the sequence, catching cases where individual ratios look fine but the overall sequence has drifted</li>
         </ul>
 
-        <p>These filters prevent stale rollouts from producing destructive gradient updates — the same kind of instability that killed my 4B model training.</p>
+        <p>This multi-level masking was described as "critical to scale to long-context RL training" in the INTELLECT-3 report, which used it to train a 106B-parameter MoE model on 512 H200 GPUs. In my experience at a much smaller scale, it was still the difference between stable training and the kind of degeneration I saw with the 4B model.</p>
 
         <h3>Why This Architecture Matters</h3>
 
