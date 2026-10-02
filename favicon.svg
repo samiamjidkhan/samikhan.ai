@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <style>
+    rect { fill: #0a0a0a; }
+    text { fill: #FAF9F6; }
+    @media (prefers-color-scheme: dark) {
+      rect { fill: #FAF9F6; }
+      text { fill: #0a0a0a; }
+    }
+  </style>
+  <rect width="64" height="64" rx="12"/>
+  <text x="32" y="33" text-anchor="middle" dominant-baseline="central" font-family="SF Mono, Menlo, Monaco, Consolas, monospace" font-size="34" font-weight="600" letter-spacing="-2">sk</text>
+</svg>
